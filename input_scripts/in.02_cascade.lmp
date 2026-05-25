@@ -1,0 +1,154 @@
+# =============================================================================
+# 02_cascade.lmp
+# 5 keV Ga PKA cascade + dynamic recovery + quench
+#
+# Usage:
+#   lmp_serial -in in.02_cascade.lmp
+# =============================================================================
+
+variable energy   equal 5000
+variable pka_type equal 1
+variable seed1    equal 12345
+variable seed2    equal 67890
+
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+# ---- Load equilibrated bulk ----
+read_data GaN_equilibrated.data
+
+mass 1 69.723   # Ga
+mass 2 14.007   # N
+
+# ---- Potential ----
+pair_style      hybrid/overlay tersoff zbl 0.5 1.2
+pair_coeff      * * tersoff GaN.tersoff Ga N
+pair_coeff      1 1 zbl 31.0 31.0
+pair_coeff      1 2 zbl 31.0 7.0
+pair_coeff      2 2 zbl 7.0 7.0
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check yes
+
+# ---- Output filenames ----
+variable outDump string dump.cascade.lammpstrj
+variable outData string GaN_post_cascade.data
+
+# ---- Generate 0K reference (BEFORE cascade, same box & atoms) ----
+minimize 1.0e-8 1.0e-10 10000 100000
+write_data GaN_0K_reference.data
+print ">>> 0K reference saved (exact cascade box)."
+
+# ---- Re-thermalize to 300K for cascade ----
+velocity all create 300.0 12345 mom yes rot yes dist gaussian
+reset_timestep 0
+
+# ---- Define thermostat shell (outer 8 Å on each side) ----
+variable sxlo equal xlo+8.0
+variable sxhi equal xhi-8.0
+variable sylo equal ylo+8.0
+variable syhi equal yhi-8.0
+variable szlo equal zlo+8.0
+variable szhi equal zhi-8.0
+
+region r_inner block ${sxlo} ${sxhi} ${sylo} ${syhi} ${szlo} ${szhi} units box
+group  inner region r_inner
+group  shell subtract all inner
+
+# ---- Select PKA: atom of correct type nearest box center ----
+variable cx equal (xhi+xlo)/2.0
+variable cy equal (yhi+ylo)/2.0
+variable cz equal (zhi+zlo)/2.0
+
+region r_pka_zone sphere ${cx} ${cy} ${cz} 5.0 units box
+
+group pka_type type ${pka_type}
+group pka_zone region r_pka_zone
+group pka_candidates intersect pka_type pka_zone
+
+# Pick a PKA deterministically using per-atom ID property
+compute atom_ids pka_candidates property/atom id
+compute min_pka_id pka_candidates reduce min c_atom_ids
+run 0
+variable pka_id equal c_min_pka_id
+group pka id ${pka_id}
+print ">>> PKA atom ID: ${pka_id}  Type: ${pka_type}  Energy: ${energy} eV"
+
+# ---- Set PKA mass for velocity calculation ----
+if "${pka_type} == 1" then &
+    "variable pka_mass equal 69.723" &
+else &
+    "variable pka_mass equal 14.007"
+
+# ---- Random direction (uniform on sphere) ----
+variable u equal random(0.0,1.0,${seed1})
+variable v equal random(0.0,1.0,${seed2})
+variable theta equal acos(1.0-2.0*${u})
+variable phi   equal 2.0*3.14159265358979*${v}
+
+# ---- PKA velocity: v = 138.914 * sqrt(E/m) ----
+variable conv equal 138.91388
+variable pka_v equal ${conv}*sqrt(${energy}/${pka_mass})
+
+variable vx equal ${pka_v}*sin(${theta})*cos(${phi})
+variable vy equal ${pka_v}*sin(${theta})*sin(${phi})
+variable vz equal ${pka_v}*cos(${theta})
+
+velocity pka set ${vx} ${vy} ${vz} units box
+print ">>> PKA velocity: vx=${vx} vy=${vy} vz=${vz}  |v|=${pka_v} Å/ps"
+
+reset_timestep 0
+
+# ========================================
+# PHASE 1: Ballistic Cascade (NVE core + Langevin shell)
+# ========================================
+fix shell_lang shell langevin 300.0 300.0 0.5 ${seed1}
+fix shell_nve  shell nve
+fix inner_nve  inner nve
+
+fix adapt_dt all dt/reset 1 1.0e-5 2.0e-4 0.1 units box
+timestep 0.0002
+
+compute ke_atom all ke/atom
+dump 1 all custom 100 ${outDump} id type x y z vx vy vz c_ke_atom
+dump_modify 1 sort id
+
+thermo 100
+thermo_style custom step dt temp pe ke etotal press
+
+run 5000
+print ">>> Cascade phase complete."
+
+# ========================================
+# PHASE 2: Dynamic Recovery at 300K (NVT — keeps box fixed for clean W-S)
+# ========================================
+unfix adapt_dt
+unfix shell_lang
+unfix shell_nve
+unfix inner_nve
+
+timestep 0.001
+fix recovery all nvt temp 300.0 300.0 1.0
+run 20000
+unfix recovery
+print ">>> Dynamic recovery complete."
+
+# ========================================
+# PHASE 3: Quench to 1K (for clean W-S defect counting)
+# ========================================
+fix quench all nvt temp 300.0 1.0 1.0
+run 10000
+unfix quench
+print ">>> Quench complete."
+
+# ---- Final minimization for cleanest W-S analysis ----
+minimize 1.0e-6 1.0e-8 10000 100000
+print ">>> Final minimization complete."
+
+# ---- Save final structure ----
+write_data ${outData}
+print ">>> Output: ${outData}"
+print ">>> Dump:   ${outDump}"
+print "DONE."
